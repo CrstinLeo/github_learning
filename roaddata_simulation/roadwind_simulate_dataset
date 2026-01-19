@@ -1,0 +1,70 @@
+import numpy as np
+import pandas as pd
+
+def make_truck_wind_dataset(
+    n_seconds=900,          # 15 min at 1 Hz
+    dt=1.0,
+    v_mean=22.0,            # average truck speed (m/s) ~ 79 km/h
+    v_std=1.5,
+    wind_mean=6.0,          # mean wind speed (m/s)
+    wind_std=1.2,
+    seed=42,
+    out_csv="truck_wind_sample.csv"
+):
+    rng = np.random.default_rng(seed)
+
+    # time axis
+    t0 = pd.Timestamp("2026-01-19 12:00:00")
+    time = pd.date_range(t0, periods=n_seconds, freq=f"{int(dt*1000)}ms")
+
+    # truck speed & distance
+    speed = np.clip(rng.normal(v_mean, v_std, size=n_seconds), 5.0, None)
+    distance = np.cumsum(speed * dt)  # meters
+
+    # wind speed with noise + occasional spikes + occasional dropouts
+    wind_speed = np.clip(rng.normal(wind_mean, wind_std, size=n_seconds), 0.0, None)
+
+    # spikes (e.g., sensor glitch)
+    spike_idx = rng.choice(n_seconds, size=max(1, n_seconds // 200), replace=False)
+    wind_speed[spike_idx] += rng.uniform(8, 15, size=len(spike_idx))
+
+    # dropouts
+    dropout_idx = rng.choice(n_seconds, size=max(1, n_seconds // 300), replace=False)
+    wind_speed[dropout_idx] = np.nan
+
+    # wind direction clustered around 0 deg with wrap-around near 360
+    # mixture: around +5 deg and around -5 deg (mapped to 355)
+    mix = rng.uniform(0, 1, size=n_seconds)
+    dir_rel = np.where(
+        mix < 0.6,
+        rng.normal(loc=5.0, scale=4.0, size=n_seconds),    # around 0..10
+        rng.normal(loc=-5.0, scale=4.0, size=n_seconds)    # around 350..360 after wrap
+    )
+
+    # occasional rapid flips (more realistic disturbances)
+    flip_idx = rng.choice(n_seconds, size=max(1, n_seconds // 150), replace=False)
+    dir_rel[flip_idx] += rng.normal(loc=0, scale=25, size=len(flip_idx))
+
+    # convert to 0..360
+    wind_dir = (dir_rel % 360)
+
+    df = pd.DataFrame({
+        "time": time,
+        "distance_m": distance,
+        "speed_mps": speed,
+        "wind_speed_mps": wind_speed,
+        "wind_dir_deg": wind_dir
+    })
+
+    # simple label
+    df["note"] = ""
+    df.loc[spike_idx, "note"] = "spike"
+    df.loc[dropout_idx, "note"] = "dropout"
+
+    df.to_csv(out_csv, index=False)
+    return out_csv, df
+
+if __name__ == "__main__":
+    path, df = make_truck_wind_dataset()
+    print("Saved:", path)
+    print(df.head(10))

@@ -1,0 +1,368 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy import stats
+import warnings
+warnings.filterwarnings('ignore')
+
+
+def remove_outliers_iqr(data, multiplier=1.5):
+    """
+    使用 IQR 方法剔除异常值
+    
+    参数:
+    - data: 数据数组
+    - multiplier: IQR乘数（默认1.5）
+    
+    返回:
+    - cleaned_data: 清洗后的数据
+    - outlier_mask: 异常值掩码
+    - outlier_count: 异常值个数
+    """
+    Q1 = np.percentile(data, 25)
+    Q3 = np.percentile(data, 75)
+    IQR = Q3 - Q1
+    lower_bound = Q1 - multiplier * IQR
+    upper_bound = Q3 + multiplier * IQR
+    
+    outlier_mask = (data < lower_bound) | (data > upper_bound)
+    cleaned_data = data[~outlier_mask]
+    outlier_count = np.sum(outlier_mask)
+    
+    return cleaned_data, outlier_mask, outlier_count
+
+
+def remove_outliers_hampel(data, window=5, threshold=3):
+    """
+    使用 Hampel 方法剔除异常值
+    
+    参数:
+    - data: 数据数组
+    - window: 窗口大小
+    - threshold: Hampel阈值（默认3）
+    
+    返回:
+    - cleaned_data: 清洗后的数据
+    - outlier_mask: 异常值掩码
+    - outlier_count: 异常值个数
+    """
+    # 计算中位数和MAD（中位数绝对偏差）
+    data_median = np.median(data)
+    mad = np.median(np.abs(data - data_median))
+    
+    # Hampel识别规则
+    hampel_threshold = threshold * 1.4826 * mad
+    outlier_mask = np.abs(data - data_median) > hampel_threshold
+    cleaned_data = data[~outlier_mask]
+    outlier_count = np.sum(outlier_mask)
+    
+    return cleaned_data, outlier_mask, outlier_count
+
+
+def load_and_segment_data(csv_file='truck_wind_sample.csv', segment_size=1000):
+    """
+    加载 CSV 数据并按距离分段
+    
+    参数:
+    - csv_file: CSV 文件路径
+    - segment_size: 每个 segment 的距离（米）
+    
+    返回:
+    - df: 原始数据
+    - segments_data: 分段后的数据字典
+    """
+    df = pd.read_csv(csv_file)
+    
+    # 计算最大距离
+    max_distance = df['distance_m'].max()
+    
+    # 创建 segment 标签
+    df['segment_id'] = (df['distance_m'] // segment_size).astype(int)
+    
+    # 按 segment 分组
+    segments_data = {}
+    for seg_id in sorted(df['segment_id'].unique()):
+        seg_df = df[df['segment_id'] == seg_id]
+        segment_start = seg_id * segment_size
+        segment_end = (seg_id + 1) * segment_size
+        
+        segments_data[seg_id] = {
+            'start_m': segment_start,
+            'end_m': segment_end,
+            'data': seg_df
+        }
+    
+    return df, segments_data
+
+def circular_mean_std(deg):
+    rad = np.deg2rad(deg)
+    sin_mean = np.mean(np.sin(rad))
+    cos_mean = np.mean(np.cos(rad))
+    mean = (np.rad2deg(np.arctan2(sin_mean, cos_mean)) + 360) % 360
+
+    R = np.sqrt(sin_mean**2 + cos_mean**2)  # 方向一致性 0~1
+    circ_std = np.sqrt(-2*np.log(R)) if R > 0 else np.nan
+    return mean, circ_std, R
+
+def calculate_segment_statistics(segments_data, outlier_method='iqr'):
+    """
+    计算每个 segment 的风速和风向统计数据
+    
+    参数:
+    - segments_data: 分段数据
+    - outlier_method: 异常值剔除方法 ('iqr' 或 'hampel')
+    
+    返回:
+    - stats_list: 包含每个 segment 统计信息的列表
+    """
+    stats_list = []
+    
+    for seg_id, seg_info in segments_data.items():
+        seg_df = seg_info['data']
+        
+        # 移除 NaN 值
+        wind_speed_raw = seg_df['wind_speed_mps'].dropna().values
+        wind_dir = seg_df['wind_dir_deg'].dropna()
+        
+        if len(wind_speed_raw) > 0 and len(wind_dir) > 0:
+            # ===== 1. 风速数据清洗 =====
+            original_count = len(wind_speed_raw)
+            
+            # 使用选择的方法剔除异常值
+            if outlier_method == 'iqr':
+                wind_speed_clean, _, outlier_count = remove_outliers_iqr(wind_speed_raw)
+            else:  # hampel
+                wind_speed_clean, _, outlier_count = remove_outliers_hampel(wind_speed_raw)
+            
+            outlier_ratio = outlier_count / original_count if original_count > 0 else 0
+            
+            # ===== 2. 风速基础统计（使用清洗后数据）=====
+            wind_speed_mean = np.mean(wind_speed_clean)
+            wind_speed_std = np.std(wind_speed_clean)
+            wind_speed_median = np.median(wind_speed_clean)
+            wind_speed_min = np.min(wind_speed_clean)
+            wind_speed_max = np.max(wind_speed_clean)
+            wind_speed_p90 = np.percentile(wind_speed_clean, 90)
+            
+            # ===== 3. 风速正态性检验（Shapiro-Wilk）=====
+            if len(wind_speed_clean) >= 3:  # Shapiro需要至少3个样本
+                shapiro_stat, shapiro_p = stats.shapiro(wind_speed_clean)
+                is_normal = shapiro_p >= 0.05
+            else:
+                shapiro_p = np.nan
+                is_normal = False
+
+            # ===== 4. 风向圆统计（使用 sin/cos 处理避免0-10和350-360的偏差）=====
+            dir_circ_mean, dir_circ_std, dir_R = circular_mean_std(wind_dir.values)
+            
+            # ===== 5. 风向相对角转换（用于可视化）=====
+            wind_dir_relative = ((wind_dir.values + 180) % 360) - 180
+            
+            # 保存统计结果
+            speed_stats = {
+                'segment_id': seg_id,
+                'segment_range': f"{seg_info['start_m']:.0f}-{seg_info['end_m']:.0f}m",
+                # 风速统计
+                'wind_speed_original_count': original_count,
+                'wind_speed_outlier_count': outlier_count,
+                'wind_speed_clean_count': len(wind_speed_clean),
+                'wind_speed_outlier_ratio': outlier_ratio,
+                'wind_speed_mean': wind_speed_mean,
+                'wind_speed_std': wind_speed_std,
+                'wind_speed_min': wind_speed_min,
+                'wind_speed_max': wind_speed_max,
+                'wind_speed_median': wind_speed_median,
+                'wind_speed_p90': wind_speed_p90,
+                'wind_speed_shapiro_p': shapiro_p,
+                'wind_speed_is_normal': is_normal,
+                # 风向线性统计
+                'wind_dir_mean': wind_dir.mean(),
+                'wind_dir_std': wind_dir.std(),
+                'wind_dir_min': wind_dir.min(),
+                'wind_dir_max': wind_dir.max(),
+                'wind_dir_median': wind_dir.median(),
+                'wind_dir_count': len(wind_dir),
+                # 风向圆统计
+                'wind_dir_circ_mean': dir_circ_mean,
+                'wind_dir_circ_std': dir_circ_std,
+                'wind_dir_consistency_R': dir_R,
+                # 原始数据（用于绘图）
+                'wind_speed_clean': wind_speed_clean,
+                'wind_dir': wind_dir.values,
+                'wind_dir_relative': wind_dir_relative,
+            }
+            stats_list.append(speed_stats)
+    
+    return stats_list
+
+
+def plot_distribution_analysis(df, segments_data, output_file='wind_analysis.png'):
+    """
+    绘制每个 segment 的风速和风向分布图，包括QQ-plot和圆统计
+    """
+    # 获取统计数据
+    stats_list = calculate_segment_statistics(segments_data)
+    n_segments = len(stats_list)
+    
+    # 创建子图（每个segment 3列：直方图, QQ-plot, 风向直方图）
+    fig, axes = plt.subplots(n_segments, 3, figsize=(16, 4.5*n_segments))
+    
+    # 如果只有一个 segment，需要处理 axes 的形状
+    if n_segments == 1:
+        axes = axes.reshape(1, -1)
+    
+    plt.suptitle('Road Segments - Distribution Analysis\n(Wind Speed with Normality Test & Wind Direction with Circular Statistics)', 
+                 fontsize=16, fontweight='bold', y=0.995)
+    
+    for idx, stats_info in enumerate(stats_list):
+        seg_id = stats_info['segment_id']
+        
+        # 提取清洗后的数据
+        wind_speed_clean = stats_info['wind_speed_clean']
+        wind_dir = stats_info['wind_dir']
+        wind_dir_relative = stats_info['wind_dir_relative']
+        
+        # ===== 左图：风速直方图与正态分布拟合 =====
+        ax_speed_hist = axes[idx, 0]
+        ax_speed_hist.hist(wind_speed_clean, bins=15, color='steelblue', alpha=0.7, edgecolor='black', density=True)
+        
+        # 拟合正态分布
+        mu_speed = stats_info['wind_speed_mean']
+        sigma_speed = stats_info['wind_speed_std']
+        x_speed = np.linspace(wind_speed_clean.min(), wind_speed_clean.max(), 100)
+        ax_speed_hist.plot(x_speed, stats.norm.pdf(x_speed, mu_speed, sigma_speed), 
+                     'r-', linewidth=2.5, label='Normal Distribution Fit')
+        
+        ax_speed_hist.set_xlabel('Wind Speed (m/s)', fontsize=10)
+        ax_speed_hist.set_ylabel('Density', fontsize=10)
+        
+        normality_text = "✓ Normal" if stats_info['wind_speed_is_normal'] else "✗ Non-Normal"
+        outlier_info = f"Outliers: {stats_info['wind_speed_outlier_count']}/{stats_info['wind_speed_original_count']} ({stats_info['wind_speed_outlier_ratio']*100:.1f}%)"
+        
+        ax_speed_hist.set_title(f'Segment {seg_id} ({stats_info["segment_range"]}) - Wind Speed Distribution\n' +
+                          f'Mean: {mu_speed:.2f} m/s, P90: {stats_info["wind_speed_p90"]:.2f} m/s [p-value: {stats_info["wind_speed_shapiro_p"]:.4f}, {normality_text}]\n{outlier_info}',
+                          fontsize=10, fontweight='bold')
+        ax_speed_hist.grid(True, alpha=0.3)
+        ax_speed_hist.legend(fontsize=9)
+        
+        # ===== 中图：QQ-plot（正态性检验可视化）=====
+        ax_qq = axes[idx, 1]
+        stats.probplot(wind_speed_clean, dist="norm", plot=ax_qq)
+        ax_qq.set_title(f'Q-Q Plot - Normality Test\n(Points close to red line indicate normality)', 
+                       fontsize=10, fontweight='bold')
+        ax_qq.grid(True, alpha=0.3)
+        
+        # ===== 右图：风向直方图（相对角表示）=====
+        ax_dir = axes[idx, 2]
+        ax_dir.hist(wind_dir_relative, bins=18, color='coral', alpha=0.7, edgecolor='black', density=True, range=(-180, 180))
+        
+        # 添加圆均值标记（转换回相对角）
+        circ_mean = stats_info['wind_dir_circ_mean']
+        circ_mean_relative = ((circ_mean + 180) % 360) - 180
+        ax_dir.axvline(circ_mean_relative, color='purple', linestyle='--', linewidth=2.5, 
+                      label=f'Circular Mean: {circ_mean:.1f}°')
+        
+        ax_dir.set_xlabel('Wind Direction - Relative Angle (degree)', fontsize=10)
+        ax_dir.set_ylabel('Density', fontsize=10)
+        
+        ax_dir.set_title(f'Segment {seg_id} - Wind Direction (Circular Statistics)\n' +
+                        f'CircMean: {circ_mean:.2f}°, CircStd: {stats_info["wind_dir_circ_std"]:.4f}, R: {stats_info["wind_dir_consistency_R"]:.4f}',
+                        fontsize=10, fontweight='bold')
+        ax_dir.set_xlim(-180, 180)
+        ax_dir.grid(True, alpha=0.3)
+        ax_dir.legend(fontsize=9)
+    
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=150, bbox_inches='tight')
+    print(f"✓ 图表已保存到: {output_file}")
+    plt.show()
+
+
+def print_statistics_table(stats_list):
+    """
+    打印详细的统计信息表，包含异常值剔除和圆统计
+    """
+    print("\n" + "="*180)
+    print("COMPREHENSIVE WIND STATISTICS SUMMARY (WITH DATA CLEANING & CIRCULAR STATISTICS)")
+    print("="*180)
+    
+    for stats in stats_list:
+        print(f"\nSegment ID: {stats['segment_id']} | Range: {stats['segment_range']}")
+        print("-" * 180)
+        
+        # 风速数据质量信息
+        print(f"Data Cleaning (Wind Speed):")
+        print(f"  Original Count: {stats['wind_speed_original_count']}, "
+              f"Outliers Removed: {stats['wind_speed_outlier_count']}, "
+              f"Clean Count: {stats['wind_speed_clean_count']}, "
+              f"Outlier Ratio: {stats['wind_speed_outlier_ratio']*100:.2f}%")
+        
+        # 风速统计
+        print(f"\nWind Speed Statistics (cleaned data):")
+        print(f"  Mean: {stats['wind_speed_mean']:.4f} m/s, "
+              f"Std: {stats['wind_speed_std']:.4f} m/s, "
+              f"Median: {stats['wind_speed_median']:.4f} m/s")
+        print(f"  Min: {stats['wind_speed_min']:.4f} m/s, "
+              f"Max: {stats['wind_speed_max']:.4f} m/s, "
+              f"P90: {stats['wind_speed_p90']:.4f} m/s")
+        
+        # 正态性检验
+        normality_judgment = "✓ Normal (p ≥ 0.05)" if stats['wind_speed_is_normal'] else "✗ Non-Normal (p < 0.05)"
+        print(f"  Normality Test (Shapiro-Wilk): p-value = {stats['wind_speed_shapiro_p']:.6f} → {normality_judgment}")
+        
+        # 风向线性统计
+        print(f"\nWind Direction Statistics (Linear):")
+        print(f"  Mean: {stats['wind_dir_mean']:.2f}°, "
+              f"Std: {stats['wind_dir_std']:.2f}°, "
+              f"Median: {stats['wind_dir_median']:.2f}°")
+        print(f"  Min: {stats['wind_dir_min']:.2f}°, "
+              f"Max: {stats['wind_dir_max']:.2f}°, "
+              f"Count: {stats['wind_dir_count']}")
+        
+        # 风向圆统计
+        print(f"\nWind Direction Statistics (Circular - sin/cos transformed):")
+        print(f"  Circular Mean: {stats['wind_dir_circ_mean']:.2f}°")
+        print(f"  Circular Std: {stats['wind_dir_circ_std']:.6f} rad")
+        print(f"  Consistency (R): {stats['wind_dir_consistency_R']:.6f} (Range: 0~1, closer to 1 = more concentrated)")
+        
+        # 判断风向集中度
+        if stats['wind_dir_consistency_R'] > 0.9:
+            concentration = "Very High (consistent direction)"
+        elif stats['wind_dir_consistency_R'] > 0.7:
+            concentration = "High"
+        elif stats['wind_dir_consistency_R'] > 0.5:
+            concentration = "Moderate"
+        else:
+            concentration = "Low (dispersed)"
+        print(f"  Direction Concentration: {concentration}")
+    
+    print("\n" + "="*180 + "\n")
+
+
+if __name__ == "__main__":
+    # 1. 加载数据并按 1000 米分段
+    print("="*80)
+    print("WIND SPEED AND DIRECTION ANALYSIS PIPELINE")
+    print("="*80)
+    
+    print("\n[Step 1] Loading and segmenting data...")
+    df, segments_data = load_and_segment_data(segment_size=1000)
+    print(f"  ✓ Total distance: {df['distance_m'].max():.2f} m")
+    print(f"  ✓ Number of segments: {len(segments_data)}")
+    
+    # 2. 计算统计数据（使用 IQR 方法进行异常值剔除）
+    print("\n[Step 2] Calculating statistics with outlier removal (IQR method)...")
+    stats_list = calculate_segment_statistics(segments_data, outlier_method='iqr')
+    print(f"  ✓ Processed {len(stats_list)} segments")
+    
+    # 3. 打印详细统计信息
+    print("\n[Step 3] Printing comprehensive statistics...")
+    print_statistics_table(stats_list)
+    
+    # 4. 绘制分布图
+    print("[Step 4] Generating distribution plots...")
+    plot_distribution_analysis(df, segments_data)
+    
+    print("="*80)
+    print("ANALYSIS COMPLETE")
+    print("="*80)
